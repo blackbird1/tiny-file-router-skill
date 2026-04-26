@@ -6,6 +6,7 @@ import math
 import os
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,9 @@ class TinyFileRouter:
         self.file_index_path = self.data_dir / "files.faiss"
         self.chunk_index_path = self.data_dir / "chunks.faiss"
         
+        # Thread safety for indices and sqlite
+        self._lock = threading.Lock()
+
         # Load model at startup
         self.model = SentenceTransformer(model_name, device="cpu")
         self.dim = self.model.get_embedding_dimension()
@@ -65,7 +69,8 @@ class TinyFileRouter:
         self.max_chars = max_chars
         self.overlap_sentences = max(0, overlap_sentences)
         
-        self.conn = sqlite3.connect(self.db_path)
+        # Allow cross-thread usage for FastAPI worker threads
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
         
@@ -73,39 +78,41 @@ class TinyFileRouter:
         self.chunk_index = self._load_or_create_index(self.chunk_index_path)
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def _init_db(self) -> None:
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                filename TEXT NOT NULL UNIQUE,
-                path TEXT NOT NULL,
-                sha256 TEXT NOT NULL,
-                content TEXT NOT NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                embedding BLOB NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        with self._lock:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL UNIQUE,
+                    path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    embedding BLOB NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id INTEGER NOT NULL,
-                ordinal INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                weight REAL NOT NULL,
-                embedding BLOB NOT NULL,
-                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
-                UNIQUE(file_id, ordinal)
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    embedding BLOB NOT NULL,
+                    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+                    UNIQUE(file_id, ordinal)
+                )
+                """
             )
-            """
-        )
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)")
-        self.conn.commit()
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)")
+            self.conn.commit()
 
     def _load_or_create_index(self, path: Path) -> faiss.IndexIDMap:
         if path.exists():
@@ -232,157 +239,162 @@ class TinyFileRouter:
         file_embedding = self.weighted_file_embedding(chunk_embeddings, weights)
         blob = file_embedding.astype("float32").tobytes()
 
-        cur = self.conn.execute("SELECT id FROM files WHERE filename = ?", (filename,))
-        existing = cur.fetchone()
-        if existing:
-            file_id = int(existing["id"])
-            self.conn.execute(
-                """
-                UPDATE files
-                SET path=?, sha256=?, content=?, metadata_json=?, embedding=?, updated_at=CURRENT_TIMESTAMP
-                WHERE id=?
-                """,
-                (path, sha, content, json.dumps(metadata), blob, file_id),
-            )
-            self.conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
-        else:
-            cur = self.conn.execute(
-                """
-                INSERT INTO files (filename, path, sha256, content, metadata_json, embedding)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (filename, path, sha, content, json.dumps(metadata), blob),
-            )
-            file_id = int(cur.lastrowid)
+        with self._lock:
+            cur = self.conn.execute("SELECT id FROM files WHERE filename = ?", (filename,))
+            existing = cur.fetchone()
+            if existing:
+                file_id = int(existing["id"])
+                self.conn.execute(
+                    """
+                    UPDATE files
+                    SET path=?, sha256=?, content=?, metadata_json=?, embedding=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (path, sha, content, json.dumps(metadata), blob, file_id),
+                )
+                self.conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+            else:
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO files (filename, path, sha256, content, metadata_json, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (filename, path, sha, content, json.dumps(metadata), blob),
+                )
+                file_id = int(cur.lastrowid)
 
-        self.conn.executemany(
-            """
-            INSERT INTO chunks (file_id, ordinal, text, weight, embedding)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (file_id, i, chunk, float(weights[i]), chunk_embeddings[i].astype("float32").tobytes())
-                for i, chunk in enumerate(chunks)
-            ],
-        )
-        self.conn.commit()
+            self.conn.executemany(
+                """
+                INSERT INTO chunks (file_id, ordinal, text, weight, embedding)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (file_id, i, chunk, float(weights[i]), chunk_embeddings[i].astype("float32").tobytes())
+                    for i, chunk in enumerate(chunks)
+                ],
+            )
+            self.conn.commit()
 
-        self.rebuild_index()
-        record = self.get(filename)
-        assert record is not None
-        return record
+            self.rebuild_index()
+            record = self.get(filename)
+            assert record is not None
+            return record
 
     def get(self, filename: str) -> FileRecord | None:
-        row = self.conn.execute(
-            """
-            SELECT f.*, COUNT(c.id) AS chunk_count
-            FROM files f
-            LEFT JOIN chunks c ON c.file_id = f.id
-            WHERE f.filename = ?
-            GROUP BY f.id
-            """,
-            (filename,),
-        ).fetchone()
-        if row is None:
-            return None
-        return FileRecord(
-            id=int(row["id"]),
-            filename=row["filename"],
-            path=row["path"],
-            sha256=row["sha256"],
-            content=row["content"],
-            metadata=json.loads(row["metadata_json"] or "{}"),
-            chunk_count=int(row["chunk_count"] or 0),
-        )
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT f.*, COUNT(c.id) AS chunk_count
+                FROM files f
+                LEFT JOIN chunks c ON c.file_id = f.id
+                WHERE f.filename = ?
+                GROUP BY f.id
+                """,
+                (filename,),
+            ).fetchone()
+            if row is None:
+                return None
+            return FileRecord(
+                id=int(row["id"]),
+                filename=row["filename"],
+                path=row["path"],
+                sha256=row["sha256"],
+                content=row["content"],
+                metadata=json.loads(row["metadata_json"] or "{}"),
+                chunk_count=int(row["chunk_count"] or 0),
+            )
 
     def get_chunks(self, filename: str) -> list[dict[str, Any]]:
         record = self.get(filename)
         if record is None:
             return []
-        rows = self.conn.execute(
-            "SELECT ordinal, text, weight FROM chunks WHERE file_id = ? ORDER BY ordinal",
-            (record.id,),
-        ).fetchall()
-        return [{"ordinal": int(r["ordinal"]), "weight": float(r["weight"]), "text": r["text"]} for r in rows]
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT ordinal, text, weight FROM chunks WHERE file_id = ? ORDER BY ordinal",
+                (record.id,),
+            ).fetchall()
+            return [{"ordinal": int(r["ordinal"]), "weight": float(r["weight"]), "text": r["text"]} for r in rows]
 
     def search(self, query: str, top_k: int = 5, chunk_k: int | None = None) -> list[dict[str, Any]]:
-        if self.file_index.ntotal == 0 and self.chunk_index.ntotal == 0:
-            return []
-        q = self._embed_one(query)
-        chunk_k = chunk_k or max(top_k * 8, 20)
-        file_scores: dict[int, float] = {}
-        chunk_hits: dict[int, list[dict[str, Any]]] = {}
+        with self._lock:
+            if self.file_index.ntotal == 0 and self.chunk_index.ntotal == 0:
+                return []
+            q = self._embed_one(query)
+            chunk_k = chunk_k or max(top_k * 8, 20)
+            file_scores: dict[int, float] = {}
+            chunk_hits: dict[int, list[dict[str, Any]]] = {}
 
-        if self.file_index.ntotal:
-            scores, ids = self.file_index.search(q, min(top_k * 4, self.file_index.ntotal))
-            for score, file_id in zip(scores[0], ids[0]):
-                if file_id >= 0:
-                    file_scores[int(file_id)] = max(file_scores.get(int(file_id), -1.0), float(score))
+            if self.file_index.ntotal:
+                scores, ids = self.file_index.search(q, min(top_k * 4, self.file_index.ntotal))
+                for score, file_id in zip(scores[0], ids[0]):
+                    if file_id >= 0:
+                        file_scores[int(file_id)] = max(file_scores.get(int(file_id), -1.0), float(score))
 
-        if self.chunk_index.ntotal:
-            scores, ids = self.chunk_index.search(q, min(chunk_k, self.chunk_index.ntotal))
-            for score, chunk_id in zip(scores[0], ids[0]):
-                if chunk_id < 0:
-                    continue
-                row = self.conn.execute(
-                    """
-                    SELECT c.id AS chunk_id, c.file_id, c.ordinal, c.text, c.weight,
-                           f.filename, f.path, f.sha256, f.metadata_json
-                    FROM chunks c
-                    JOIN files f ON f.id = c.file_id
-                    WHERE c.id = ?
-                    """,
-                    (int(chunk_id),),
-                ).fetchone()
+            if self.chunk_index.ntotal:
+                scores, ids = self.chunk_index.search(q, min(chunk_k, self.chunk_index.ntotal))
+                for score, chunk_id in zip(scores[0], ids[0]):
+                    if chunk_id < 0:
+                        continue
+                    row = self.conn.execute(
+                        """
+                        SELECT c.id AS chunk_id, c.file_id, c.ordinal, c.text, c.weight,
+                               f.filename, f.path, f.sha256, f.metadata_json
+                        FROM chunks c
+                        JOIN files f ON f.id = c.file_id
+                        WHERE c.id = ?
+                        """,
+                        (int(chunk_id),),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    fid = int(row["file_id"])
+                    weighted_score = float(score) * float(row["weight"])
+                    file_scores[fid] = max(file_scores.get(fid, -1.0), weighted_score)
+                    chunk_hits.setdefault(fid, []).append(
+                        {
+                            "score": float(score),
+                            "weighted_score": weighted_score,
+                            "ordinal": int(row["ordinal"]),
+                            "weight": float(row["weight"]),
+                            "text": row["text"],
+                        }
+                    )
+
+            ranked = sorted(file_scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+            results: list[dict[str, Any]] = []
+            for file_id, score in ranked:
+                row = self.conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
                 if row is None:
                     continue
-                fid = int(row["file_id"])
-                weighted_score = float(score) * float(row["weight"])
-                file_scores[fid] = max(file_scores.get(fid, -1.0), weighted_score)
-                chunk_hits.setdefault(fid, []).append(
+                best_chunks = sorted(chunk_hits.get(file_id, []), key=lambda h: h["weighted_score"], reverse=True)[:3]
+                results.append(
                     {
                         "score": float(score),
-                        "weighted_score": weighted_score,
-                        "ordinal": int(row["ordinal"]),
-                        "weight": float(row["weight"]),
-                        "text": row["text"],
+                        "filename": row["filename"],
+                        "path": row["path"],
+                        "sha256": row["sha256"],
+                        "metadata": json.loads(row["metadata_json"] or "{}"),
+                        "best_chunks": best_chunks,
                     }
                 )
-
-        ranked = sorted(file_scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-        results: list[dict[str, Any]] = []
-        for file_id, score in ranked:
-            row = self.conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
-            if row is None:
-                continue
-            best_chunks = sorted(chunk_hits.get(file_id, []), key=lambda h: h["weighted_score"], reverse=True)[:3]
-            results.append(
-                {
-                    "score": float(score),
-                    "filename": row["filename"],
-                    "path": row["path"],
-                    "sha256": row["sha256"],
-                    "metadata": json.loads(row["metadata_json"] or "{}"),
-                    "best_chunks": best_chunks,
-                }
-            )
-        return results
+            return results
 
     def rebuild_index(self) -> None:
-        file_index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
-        file_rows = self.conn.execute("SELECT id, embedding FROM files ORDER BY id").fetchall()
-        if file_rows:
-            vectors = np.vstack([self._blob_to_vec(row["embedding"], self.dim) for row in file_rows]).astype("float32")
-            ids = np.array([int(row["id"]) for row in file_rows], dtype="int64")
-            file_index.add_with_ids(vectors, ids)
+        with self._lock:
+            file_index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
+            file_rows = self.conn.execute("SELECT id, embedding FROM files ORDER BY id").fetchall()
+            if file_rows:
+                vectors = np.vstack([self._blob_to_vec(row["embedding"], self.dim) for row in file_rows]).astype("float32")
+                ids = np.array([int(row["id"]) for row in file_rows], dtype="int64")
+                file_index.add_with_ids(vectors, ids)
 
-        chunk_index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
-        chunk_rows = self.conn.execute("SELECT id, embedding FROM chunks ORDER BY id").fetchall()
-        if chunk_rows:
-            vectors = np.vstack([self._blob_to_vec(row["embedding"], self.dim) for row in chunk_rows]).astype("float32")
-            ids = np.array([int(row["id"]) for row in chunk_rows], dtype="int64")
-            chunk_index.add_with_ids(vectors, ids)
+            chunk_index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
+            chunk_rows = self.conn.execute("SELECT id, embedding FROM chunks ORDER BY id").fetchall()
+            if chunk_rows:
+                vectors = np.vstack([self._blob_to_vec(row["embedding"], self.dim) for row in chunk_rows]).astype("float32")
+                ids = np.array([int(row["id"]) for row in chunk_rows], dtype="int64")
+                chunk_index.add_with_ids(vectors, ids)
 
-        self.file_index = file_index
-        self.chunk_index = chunk_index
-        self._save_indexes()
+            self.file_index = file_index
+            self.chunk_index = chunk_index
+            self._save_indexes()

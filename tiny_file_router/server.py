@@ -4,10 +4,12 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from .const import HOME_DATA_DIR, DEFAULT_DATA_DIR
@@ -41,8 +43,10 @@ async def search(args: SearchArgs):
     if _router is None:
         raise HTTPException(status_code=503, detail="Router not initialized")
     try:
-        return _router.search(args.query, args.top_k, args.chunk_k)
+        return await run_in_threadpool(_router.search, args.query, args.top_k, args.chunk_k)
     except Exception as e:
+        print(f"ERROR in /search: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/put")
@@ -50,7 +54,7 @@ async def put(args: PutArgs):
     if _router is None:
         raise HTTPException(status_code=503, detail="Router not initialized")
     try:
-        record = _router.put_file(args.path, args.filename, args.metadata)
+        record = await run_in_threadpool(_router.put_file, args.path, args.filename, args.metadata)
         return {
             "id": record.id,
             "filename": record.filename,
@@ -58,6 +62,8 @@ async def put(args: PutArgs):
             "chunks": record.chunk_count
         }
     except Exception as e:
+        print(f"ERROR in /put: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/rebuild")
@@ -65,9 +71,11 @@ async def rebuild():
     if _router is None:
         raise HTTPException(status_code=503, detail="Router not initialized")
     try:
-        _router.rebuild_index()
+        await run_in_threadpool(_router.rebuild_index)
         return {"status": "rebuilt"}
     except Exception as e:
+        print(f"ERROR in /rebuild: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/ping")
@@ -77,6 +85,7 @@ async def ping():
 class TinyServer:
     def __init__(self, data_dir: str):
         self.data_dir = Path(data_dir)
+        self.socket_path = HOME_DATA_DIR / "router.sock"
         self.pid_file = HOME_DATA_DIR / "server.pid"
 
     def run(self, daemon: bool = True):
@@ -84,20 +93,20 @@ class TinyServer:
             print(f"Server PID file exists at {self.pid_file}. Check if running.")
             sys.exit(1)
 
-        # Build uvicorn command
+        # Build uvicorn command using UDS
         cmd = [
             sys.executable, "-m", "uvicorn", 
             "tiny_file_router.server:app",
-            "--host", "127.0.0.1",
-            "--port", "8088",
-            "--workers", "1"
+            "--uds", str(self.socket_path),
+            "--workers", "1",
+            "--timeout-keep-alive", "60"
         ]
 
         env = os.environ.copy()
         env["TINY_ROUTER_DATA_DIR"] = str(self.data_dir)
 
         if daemon:
-            print(f"Starting FastAPI server in background on http://127.0.0.1:8088...")
+            print(f"Starting FastAPI server in background via Unix Socket...")
             HOME_DATA_DIR.mkdir(parents=True, exist_ok=True)
             log_file = open(HOME_DATA_DIR / "server.log", "a")
             proc = subprocess.Popen(
@@ -108,20 +117,33 @@ class TinyServer:
                 start_new_session=True
             )
             self.pid_file.write_text(str(proc.pid))
-            print(f"Server started (PID: {proc.pid})")
+            print(f"Server started (PID: {proc.pid}). Socket: {self.socket_path}")
         else:
             subprocess.run(cmd, env=env)
 
 def send_to_server(command: str, args: Optional[dict] = None):
     import httpx
-    # Simple TCP check
-    url = "http://127.0.0.1:8088"
+    socket_path = HOME_DATA_DIR / "router.sock"
+    if not socket_path.exists():
+        return None
+
     try:
-        with httpx.Client(base_url=url, timeout=60.0) as client:
+        transport = httpx.HTTPTransport(uds=str(socket_path))
+        with httpx.Client(transport=transport, base_url="http://uds", timeout=60.0) as client:
             if command == "search":
-                resp = client.post("/search", json=args)
+                payload = {
+                    "query": args.get("query"),
+                    "top_k": args.get("top_k", 5),
+                    "chunk_k": args.get("chunk_k")
+                }
+                resp = client.post("/search", json=payload)
             elif command == "put":
-                resp = client.post("/put", json=args)
+                payload = {
+                    "path": args.get("path"),
+                    "filename": args.get("filename"),
+                    "metadata": args.get("metadata", {})
+                }
+                resp = client.post("/put", json=payload)
             elif command == "rebuild":
                 resp = client.post("/rebuild")
             elif command == "ping":
