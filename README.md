@@ -7,6 +7,7 @@ It uses:
 - `faiss-cpu` for lightning-fast vector similarity search.
 - `SQLite` for durable storage of content, chunks, and metadata.
 - **Weighted Semantic Routing**: Automatically prioritizes high-signal text (code, unique identifiers) over boilerplate (licenses, imports) when calculating file-level vectors.
+- **Hybrid search**: Combines semantic ranking with exact query-token overlap so the router can act as a context filter on large files.
 
 ## Installation
 
@@ -54,7 +55,7 @@ python -m tiny_file_router put ./path/to/file.txt --filename "custom_name.txt" -
 # Get file metadata
 python -m tiny_file_router get file.txt
 
-# Search by semantic query (returns file + high-signal chunks)
+# Search by semantic query (returns file + high-signal chunks, biased toward exact needle matches)
 python -m tiny_file_router search "database connection logic" --top-k 5
 
 # Show specific chunks for a file

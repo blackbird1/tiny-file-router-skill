@@ -1,0 +1,7 @@
+interface:
+  display_name: "Tiny File Router"
+  short_description: "Semantic search across local files"
+  default_prompt: "Use $tiny-file-router-skill to find the most relevant file and supporting chunks for this query."
+
+policy:
+  allow_implicit_invocation: true

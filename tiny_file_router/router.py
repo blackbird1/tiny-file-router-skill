@@ -158,6 +158,20 @@ class TinyFileRouter:
             return vec.astype("float32")
         return (vec / norm).astype("float32")
 
+    @staticmethod
+    def _query_tokens(text: str) -> list[str]:
+        return [tok for tok in _WORD_RE.findall(text.lower()) if len(tok) > 1]
+
+    @staticmethod
+    def _token_overlap_score(query_tokens: list[str], text: str) -> float:
+        if not query_tokens:
+            return 0.0
+        haystack = set(_WORD_RE.findall(text.lower()))
+        hits = sum(1 for tok in query_tokens if tok in haystack)
+        if hits == 0:
+            return 0.0
+        return hits / len(query_tokens)
+
     def split_sentences(self, text: str) -> list[str]:
         text = re.sub(r"\r\n?", "\n", text).strip()
         if not text:
@@ -321,6 +335,7 @@ class TinyFileRouter:
 
     async def search(self, query: str, top_k: int = 5, chunk_k: int | None = None) -> list[dict[str, Any]]:
         q = await self._embed_one(query)
+        query_tokens = self._query_tokens(query)
 
         file_scores: dict[int, float] = {}
         chunk_hits: dict[int, list[dict[str, Any]]] = {}
@@ -347,6 +362,7 @@ class TinyFileRouter:
 
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+            file_lexical_hits: dict[int, float] = {}
             if c_ids:
                 for score, chunk_id in zip(c_scores, c_ids):
                     async with db.execute(
@@ -360,11 +376,15 @@ class TinyFileRouter:
                         (chunk_id,),
                     ) as cur:
                         row = await cur.fetchone()
-                    
+
                     if row:
                         fid = int(row["file_id"])
                         weighted_score = score * float(row["weight"])
                         file_scores[fid] = max(file_scores.get(fid, -1.0), weighted_score)
+                        if query_tokens:
+                            chunk_overlap = self._token_overlap_score(query_tokens, row["text"])
+                            if chunk_overlap > 0:
+                                file_lexical_hits[fid] = max(file_lexical_hits.get(fid, 0.0), chunk_overlap)
                         chunk_hits.setdefault(fid, []).append(
                             {
                                 "score": score,
@@ -374,6 +394,13 @@ class TinyFileRouter:
                                 "text": row["text"],
                             }
                         )
+
+            if query_tokens and file_lexical_hits:
+                file_scores = {
+                    fid: score + (0.75 * file_lexical_hits.get(fid, 0.0))
+                    for fid, score in file_scores.items()
+                    if file_lexical_hits.get(fid, 0.0) > 0
+                }
 
             ranked = sorted(file_scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
             results: list[dict[str, Any]] = []

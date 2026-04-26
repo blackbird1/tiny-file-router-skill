@@ -20,6 +20,7 @@ The skill can:
 6. Maintain FAISS indexes for both files and chunks.
 7. Retrieve by exact filename.
 8. Search by semantic similarity with chunk-level evidence for needle-in-haystack matches.
+9. Boost exact query-token overlap so search can act as a context filter on large files.
 
 ## Commands
 
@@ -36,6 +37,7 @@ python -m tiny_file_router serve stop
 ## Shared Server Design
 
 SQLite is the durable source of truth. FAISS is treated as a fast derived index.
+Search is hybrid: embeddings rank candidates, then exact query-token overlap boosts files and suppresses weak semantic neighbors when the query has real terms.
 
 To avoid reloading the MiniLM model (384-dim) for every agent call, the skill uses a background "hot" server:
 - **Socket**: `~/.tiny_file_router/router.sock` (Unix Domain Socket)
