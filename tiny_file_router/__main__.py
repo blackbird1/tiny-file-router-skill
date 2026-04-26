@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 from pathlib import Path
 
-from .router import TinyFileRouter
+# Only import lightweight things at top level
+from .const import DEFAULT_DATA_DIR, HOME_DATA_DIR
+from .server import TinyServer, send_to_server
 
 
 def main() -> None:
@@ -30,9 +34,58 @@ def main() -> None:
     search.add_argument("--hide-chunks", action="store_true")
 
     sub.add_parser("rebuild", help="Rebuild FAISS file and chunk indexes from SQLite")
+    
+    srv = sub.add_parser("serve", help="Manage the persistent background server")
+    srv.add_argument("action", choices=["start", "stop", "status"])
 
     args = parser.parse_args()
-    router = TinyFileRouter()
+    data_dir = os.environ.get("TINY_ROUTER_DATA_DIR", str(DEFAULT_DATA_DIR))
+
+    if args.command == "serve":
+        pid_file = HOME_DATA_DIR / "server.pid"
+        if args.action == "start":
+            TinyServer(data_dir=data_dir).run(daemon=True)
+        elif args.action == "stop":
+            if pid_file.exists():
+                pid = int(pid_file.read_text())
+                try:
+                    os.kill(pid, signal.SIGINT)
+                    print(f"Sent SIGINT to {pid}")
+                except ProcessLookupError:
+                    print(f"Process {pid} not found. Cleaning up stale PID file.")
+                    pid_file.unlink()
+            else:
+                print("Server not running.")
+        elif args.action == "status":
+            if pid_file.exists():
+                print(f"Running (PID: {pid_file.read_text()})")
+            else:
+                print("Stopped.")
+        return
+
+    # Try hot server first
+    server_res = None
+    if args.command in ["search", "put", "rebuild"]:
+        srv_args = vars(args)
+        server_res = send_to_server(args.command, srv_args)
+
+    if server_res is not None:
+        if "error" in server_res:
+            print(json.dumps(server_res, indent=2))
+        else:
+            if args.command == "search" and getattr(args, "hide_chunks", False):
+                for r in server_res: r.pop("best_chunks", None)
+            elif args.command == "rebuild":
+                print(server_res.get("status", "rebuilt"))
+                return
+            print(json.dumps(server_res, indent=2))
+        return
+
+    # Fallback to slow local execution
+    # HEAVY IMPORT HAPPENS HERE
+    from .router import TinyFileRouter
+    
+    router = TinyFileRouter(data_dir=data_dir)
     try:
         if args.command == "put":
             record = router.put_file(Path(args.path), filename=args.filename, metadata=json.loads(args.metadata))

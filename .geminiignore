@@ -1,0 +1,11 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local data and indexes
+router_data/
+
+# Test artifacts
+test_files/
+test.txt

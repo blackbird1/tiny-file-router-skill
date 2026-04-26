@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -14,11 +13,7 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_DATA_DIR = Path(os.environ.get("TINY_ROUTER_DATA_DIR", "router_data"))
-DEFAULT_MAX_CHARS = int(os.environ.get("TINY_ROUTER_CHUNK_MAX_CHARS", "900"))
-DEFAULT_OVERLAP_SENTENCES = int(os.environ.get("TINY_ROUTER_OVERLAP_SENTENCES", "1"))
+from .const import DEFAULT_MODEL, DEFAULT_DATA_DIR, DEFAULT_MAX_CHARS, DEFAULT_OVERLAP_SENTENCES
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'\(\[])|\n{2,}")
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
@@ -57,10 +52,8 @@ class TinyFileRouter:
         self.db_path = self.data_dir / "router.sqlite3"
         self.file_index_path = self.data_dir / "files.faiss"
         self.chunk_index_path = self.data_dir / "chunks.faiss"
-        # Backward-compatible old index name, if present.
-        self.legacy_index_path = self.data_dir / "index.faiss"
         self.model = SentenceTransformer(model_name)
-        self.dim = self.model.get_sentence_embedding_dimension()
+        self.dim = self.model.get_embedding_dimension()
         self.max_chars = max_chars
         self.overlap_sentences = max(0, overlap_sentences)
         self.conn = sqlite3.connect(self.db_path)
@@ -193,13 +186,7 @@ class TinyFileRouter:
 
     @staticmethod
     def chunk_weight(text: str) -> float:
-        """Weight high-signal chunks above boilerplate while avoiding long-text domination.
-
-        Signals:
-        - information density: unique tokens / total tokens
-        - rare-ish identifiers: numbers, snake/camel tokens, API-like terms
-        - length saturation: enough text helps, but caps out quickly
-        """
+        """Weight high-signal chunks above boilerplate while avoiding long-text domination."""
         tokens = _WORD_RE.findall(text.lower())
         if not tokens:
             return 0.25

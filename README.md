@@ -65,6 +65,29 @@ Search combines:
 python -m tiny_file_router rebuild
 ```
 
+## Shared Background Server
+
+This skill is designed to be shared across multiple agents on the same machine. To avoid the overhead of loading the MiniLM model (approx. 2-5 seconds) for every single call, you can run a persistent background server.
+
+### Start the server
+```bash
+python -m tiny_file_router serve start
+```
+The server will daemonize and store its control files in `~/.tiny_file_router/`.
+
+### Stop the server
+```bash
+python -m tiny_file_router serve stop
+```
+
+### How it works
+Once the server is running, any agent or CLI call will automatically:
+1. Detect the Unix Domain Socket at `~/.tiny_file_router/router.sock`.
+2. Send the request to the "hot" instance.
+3. Receive a nearly instantaneous response.
+
+If the server is not running, the skill gracefully falls back to loading the model locally.
+
 ## Tuning
 
 ```bash
