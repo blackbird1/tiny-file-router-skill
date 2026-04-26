@@ -8,8 +8,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.concurrency import run_in_threadpool
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from .const import HOME_DATA_DIR, DEFAULT_DATA_DIR
@@ -36,6 +35,7 @@ async def startup_event():
     print(f"[{time.ctime()}] Pre-loading MiniLM model (CPU forced)...")
     data_dir = os.environ.get("TINY_ROUTER_DATA_DIR", str(DEFAULT_DATA_DIR))
     _router = TinyFileRouter(data_dir=data_dir)
+    await _router.init()
     print(f"[{time.ctime()}] Router ready.")
 
 @app.post("/search")
@@ -43,7 +43,8 @@ async def search(args: SearchArgs):
     if _router is None:
         raise HTTPException(status_code=503, detail="Router not initialized")
     try:
-        return await run_in_threadpool(_router.search, args.query, args.top_k, args.chunk_k)
+        # NOW ASYNC: MUST AWAIT
+        return await _router.search(args.query, args.top_k, args.chunk_k)
     except Exception as e:
         print(f"ERROR in /search: {e}")
         traceback.print_exc()
@@ -54,7 +55,8 @@ async def put(args: PutArgs):
     if _router is None:
         raise HTTPException(status_code=503, detail="Router not initialized")
     try:
-        record = await run_in_threadpool(_router.put_file, args.path, args.filename, args.metadata)
+        # NOW ASYNC: MUST AWAIT
+        record = await _router.put_file(args.path, args.filename, args.metadata)
         return {
             "id": record.id,
             "filename": record.filename,
@@ -71,7 +73,8 @@ async def rebuild():
     if _router is None:
         raise HTTPException(status_code=503, detail="Router not initialized")
     try:
-        await run_in_threadpool(_router.rebuild_index)
+        # NOW ASYNC: MUST AWAIT
+        await _router.rebuild_index()
         return {"status": "rebuilt"}
     except Exception as e:
         print(f"ERROR in /rebuild: {e}")
