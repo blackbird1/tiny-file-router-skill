@@ -5,28 +5,29 @@ import json
 import math
 import os
 import re
-import sqlite3
-import threading
+import asyncio
+import aiosqlite
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Force single-threaded execution to prevent macOS segfaults with OpenMP/MPS
+import anyio
+import faiss
+import numpy as np
+import torch
+from sentence_transformers import SentenceTransformer
+
+from .const import DEFAULT_MODEL, DEFAULT_DATA_DIR, DEFAULT_MAX_CHARS, DEFAULT_OVERLAP_SENTENCES
+
+# Force single-threaded execution for stability in async environments on macOS
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-import faiss
-import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
-
 # Lock torch to 1 thread
 torch.set_num_threads(1)
-
-from .const import DEFAULT_MODEL, DEFAULT_DATA_DIR, DEFAULT_MAX_CHARS, DEFAULT_OVERLAP_SENTENCES
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'\(\[])|\n{2,}")
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
@@ -44,7 +45,7 @@ class FileRecord:
 
 
 class TinyFileRouter:
-    """Tiny content embedding router keyed by filename."""
+    """Async content embedding router keyed by filename."""
 
     def __init__(
         self,
@@ -59,31 +60,21 @@ class TinyFileRouter:
         self.file_index_path = self.data_dir / "files.faiss"
         self.chunk_index_path = self.data_dir / "chunks.faiss"
         
-        # Thread safety for indices and sqlite
-        self._lock = threading.Lock()
-
-        # Load model at startup
+        # Async lock for safe concurrent access in event loop
+        self._lock = asyncio.Lock()
+        
         self.model = SentenceTransformer(model_name, device="cpu")
         self.dim = self.model.get_embedding_dimension()
-        
         self.max_chars = max_chars
         self.overlap_sentences = max(0, overlap_sentences)
-        
-        # Allow cross-thread usage for FastAPI worker threads
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._init_db()
         
         self.file_index = self._load_or_create_index(self.file_index_path)
         self.chunk_index = self._load_or_create_index(self.chunk_index_path)
 
-    def close(self) -> None:
-        with self._lock:
-            self.conn.close()
-
-    def _init_db(self) -> None:
-        with self._lock:
-            self.conn.execute(
+    async def init(self):
+        """Async initialization for database tables."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +88,7 @@ class TinyFileRouter:
                 )
                 """
             )
-            self.conn.execute(
+            await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chunks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,8 +102,8 @@ class TinyFileRouter:
                 )
                 """
             )
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)")
-            self.conn.commit()
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)")
+            await db.commit()
 
     def _load_or_create_index(self, path: Path) -> faiss.IndexIDMap:
         if path.exists():
@@ -126,15 +117,23 @@ class TinyFileRouter:
         faiss.write_index(self.file_index, str(self.file_index_path))
         faiss.write_index(self.chunk_index, str(self.chunk_index_path))
 
-    def _embed_many(self, texts: list[str]) -> np.ndarray:
+    async def close(self) -> None:
+        async with self._lock:
+            # Context manager based db connections don't need explicit close here
+            pass
+
+    async def _embed_many(self, texts: list[str]) -> np.ndarray:
         if not texts:
             return np.zeros((0, self.dim), dtype="float32")
-        # Disable multi-process encoding which causes segfaults on macOS
-        vecs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False, batch_size=32)
+        
+        def _encode():
+            return self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False, batch_size=32)
+        
+        vecs = await anyio.to_thread.run_sync(_encode)
         return np.asarray(vecs, dtype="float32")
 
-    def _embed_one(self, text: str) -> np.ndarray:
-        return self._embed_many([text])
+    async def _embed_one(self, text: str) -> np.ndarray:
+        return await self._embed_many([text])
 
     @staticmethod
     def _read_text(path: str | Path) -> str:
@@ -218,13 +217,13 @@ class TinyFileRouter:
         avg = np.average(chunk_embeddings, axis=0, weights=w)
         return self._normalize(avg)
 
-    def put_file(self, path: str | Path, filename: str | None = None, metadata: dict[str, Any] | None = None) -> FileRecord:
+    async def put_file(self, path: str | Path, filename: str | None = None, metadata: dict[str, Any] | None = None) -> FileRecord:
         p = Path(path)
         name = filename or p.name
         content = self._read_text(p)
-        return self.put_content(name, content, str(p), metadata)
+        return await self.put_content(name, content, str(p), metadata)
 
-    def put_content(
+    async def put_content(
         self,
         filename: str,
         content: str,
@@ -234,17 +233,19 @@ class TinyFileRouter:
         metadata = metadata or {}
         sha = self._sha256(content)
         chunks = self.chunk_text(content) or [content]
-        chunk_embeddings = self._embed_many(chunks)
+        chunk_embeddings = await self._embed_many(chunks)
         weights = [self.chunk_weight(c) for c in chunks]
         file_embedding = self.weighted_file_embedding(chunk_embeddings, weights)
         blob = file_embedding.astype("float32").tobytes()
 
-        with self._lock:
-            cur = self.conn.execute("SELECT id FROM files WHERE filename = ?", (filename,))
-            existing = cur.fetchone()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT id FROM files WHERE filename = ?", (filename,)) as cur:
+                existing = await cur.fetchone()
+            
             if existing:
                 file_id = int(existing["id"])
-                self.conn.execute(
+                await db.execute(
                     """
                     UPDATE files
                     SET path=?, sha256=?, content=?, metadata_json=?, embedding=?, updated_at=CURRENT_TIMESTAMP
@@ -252,9 +253,9 @@ class TinyFileRouter:
                     """,
                     (path, sha, content, json.dumps(metadata), blob, file_id),
                 )
-                self.conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+                await db.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
             else:
-                cur = self.conn.execute(
+                cur = await db.execute(
                     """
                     INSERT INTO files (filename, path, sha256, content, metadata_json, embedding)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -263,7 +264,7 @@ class TinyFileRouter:
                 )
                 file_id = int(cur.lastrowid)
 
-            self.conn.executemany(
+            await db.executemany(
                 """
                 INSERT INTO chunks (file_id, ordinal, text, weight, embedding)
                 VALUES (?, ?, ?, ?, ?)
@@ -273,56 +274,62 @@ class TinyFileRouter:
                     for i, chunk in enumerate(chunks)
                 ],
             )
-            self.conn.commit()
+            await db.commit()
 
-            self.rebuild_index()
-            record = self.get(filename)
-            assert record is not None
-            return record
+        await self.rebuild_index()
+        record = await self.get(filename)
+        assert record is not None
+        return record
 
-    def get(self, filename: str) -> FileRecord | None:
-        with self._lock:
-            row = self.conn.execute(
+    async def get(self, filename: str) -> FileRecord | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
                 """
-                SELECT f.*, COUNT(c.id) AS chunk_count
+                SELECT f.*, (SELECT COUNT(*) FROM chunks c WHERE c.file_id = f.id) AS chunk_count
                 FROM files f
-                LEFT JOIN chunks c ON c.file_id = f.id
                 WHERE f.filename = ?
-                GROUP BY f.id
                 """,
                 (filename,),
-            ).fetchone()
-            if row is None:
-                return None
-            return FileRecord(
-                id=int(row["id"]),
-                filename=row["filename"],
-                path=row["path"],
-                sha256=row["sha256"],
-                content=row["content"],
-                metadata=json.loads(row["metadata_json"] or "{}"),
-                chunk_count=int(row["chunk_count"] or 0),
-            )
+            ) as cur:
+                row = await cur.fetchone()
+        
+        if row is None or row["id"] is None:
+            return None
+        return FileRecord(
+            id=int(row["id"]),
+            filename=row["filename"],
+            path=row["path"],
+            sha256=row["sha256"],
+            content=row["content"],
+            metadata=json.loads(row["metadata_json"] or "{}"),
+            chunk_count=int(row["chunk_count"] or 0),
+        )
 
-    def get_chunks(self, filename: str) -> list[dict[str, Any]]:
-        record = self.get(filename)
+    async def get_chunks(self, filename: str) -> list[dict[str, Any]]:
+        record = await self.get(filename)
         if record is None:
             return []
-        with self._lock:
-            rows = self.conn.execute(
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
                 "SELECT ordinal, text, weight FROM chunks WHERE file_id = ? ORDER BY ordinal",
                 (record.id,),
-            ).fetchall()
-            return [{"ordinal": int(r["ordinal"]), "weight": float(r["weight"]), "text": r["text"]} for r in rows]
+            ) as cur:
+                rows = await cur.fetchall()
+        return [{"ordinal": int(r["ordinal"]), "weight": float(r["weight"]), "text": r["text"]} for r in rows]
 
-    def search(self, query: str, top_k: int = 5, chunk_k: int | None = None) -> list[dict[str, Any]]:
-        with self._lock:
+    async def search(self, query: str, top_k: int = 5, chunk_k: int | None = None) -> list[dict[str, Any]]:
+        q = await self._embed_one(query)
+
+        file_scores: dict[int, float] = {}
+        chunk_hits: dict[int, list[dict[str, Any]]] = {}
+
+        async with self._lock:
             if self.file_index.ntotal == 0 and self.chunk_index.ntotal == 0:
                 return []
-            q = self._embed_one(query)
+            
             chunk_k = chunk_k or max(top_k * 8, 20)
-            file_scores: dict[int, float] = {}
-            chunk_hits: dict[int, list[dict[str, Any]]] = {}
 
             if self.file_index.ntotal:
                 scores, ids = self.file_index.search(q, min(top_k * 4, self.file_index.ntotal))
@@ -332,10 +339,17 @@ class TinyFileRouter:
 
             if self.chunk_index.ntotal:
                 scores, ids = self.chunk_index.search(q, min(chunk_k, self.chunk_index.ntotal))
-                for score, chunk_id in zip(scores[0], ids[0]):
-                    if chunk_id < 0:
-                        continue
-                    row = self.conn.execute(
+                c_ids = [int(cid) for cid in ids[0] if cid >= 0]
+                c_scores = [float(s) for s, cid in zip(scores[0], ids[0]) if cid >= 0]
+
+        if not c_ids and not file_scores:
+            return []
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if c_ids:
+                for score, chunk_id in zip(c_scores, c_ids):
+                    async with db.execute(
                         """
                         SELECT c.id AS chunk_id, c.file_id, c.ordinal, c.text, c.weight,
                                f.filename, f.path, f.sha256, f.metadata_json
@@ -343,53 +357,59 @@ class TinyFileRouter:
                         JOIN files f ON f.id = c.file_id
                         WHERE c.id = ?
                         """,
-                        (int(chunk_id),),
-                    ).fetchone()
-                    if row is None:
-                        continue
-                    fid = int(row["file_id"])
-                    weighted_score = float(score) * float(row["weight"])
-                    file_scores[fid] = max(file_scores.get(fid, -1.0), weighted_score)
-                    chunk_hits.setdefault(fid, []).append(
-                        {
-                            "score": float(score),
-                            "weighted_score": weighted_score,
-                            "ordinal": int(row["ordinal"]),
-                            "weight": float(row["weight"]),
-                            "text": row["text"],
-                        }
-                    )
+                        (chunk_id,),
+                    ) as cur:
+                        row = await cur.fetchone()
+                    
+                    if row:
+                        fid = int(row["file_id"])
+                        weighted_score = score * float(row["weight"])
+                        file_scores[fid] = max(file_scores.get(fid, -1.0), weighted_score)
+                        chunk_hits.setdefault(fid, []).append(
+                            {
+                                "score": score,
+                                "weighted_score": weighted_score,
+                                "ordinal": int(row["ordinal"]),
+                                "weight": float(row["weight"]),
+                                "text": row["text"],
+                            }
+                        )
 
             ranked = sorted(file_scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
             results: list[dict[str, Any]] = []
             for file_id, score in ranked:
-                row = self.conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
-                if row is None:
-                    continue
-                best_chunks = sorted(chunk_hits.get(file_id, []), key=lambda h: h["weighted_score"], reverse=True)[:3]
-                results.append(
-                    {
-                        "score": float(score),
-                        "filename": row["filename"],
-                        "path": row["path"],
-                        "sha256": row["sha256"],
-                        "metadata": json.loads(row["metadata_json"] or "{}"),
-                        "best_chunks": best_chunks,
-                    }
-                )
-            return results
+                async with db.execute("SELECT * FROM files WHERE id = ?", (file_id,)) as cur:
+                    row = await cur.fetchone()
+                if row:
+                    best_chunks = sorted(chunk_hits.get(file_id, []), key=lambda h: h["weighted_score"], reverse=True)[:3]
+                    results.append(
+                        {
+                            "score": score,
+                            "filename": row["filename"],
+                            "path": row["path"],
+                            "sha256": row["sha256"],
+                            "metadata": json.loads(row["metadata_json"] or "{}"),
+                            "best_chunks": best_chunks,
+                        }
+                    )
+        return results
 
-    def rebuild_index(self) -> None:
-        with self._lock:
+    async def rebuild_index(self) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT id, embedding FROM files ORDER BY id") as cur:
+                file_rows = await cur.fetchall()
+            async with db.execute("SELECT id, embedding FROM chunks ORDER BY id") as cur:
+                chunk_rows = await cur.fetchall()
+
+        async with self._lock:
             file_index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
-            file_rows = self.conn.execute("SELECT id, embedding FROM files ORDER BY id").fetchall()
             if file_rows:
                 vectors = np.vstack([self._blob_to_vec(row["embedding"], self.dim) for row in file_rows]).astype("float32")
                 ids = np.array([int(row["id"]) for row in file_rows], dtype="int64")
                 file_index.add_with_ids(vectors, ids)
 
             chunk_index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
-            chunk_rows = self.conn.execute("SELECT id, embedding FROM chunks ORDER BY id").fetchall()
             if chunk_rows:
                 vectors = np.vstack([self._blob_to_vec(row["embedding"], self.dim) for row in chunk_rows]).astype("float32")
                 ids = np.array([int(row["id"]) for row in chunk_rows], dtype="int64")

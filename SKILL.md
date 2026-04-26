@@ -1,3 +1,7 @@
+---
+name: tiny-file-router-skill
+description: A semantic file router that uses MiniLM embeddings and FAISS for fast file and chunk retrieval. Use this when you need to search for files or specific information within files semantically.
+---
 # Tiny File Router Skill
 
 ## Purpose

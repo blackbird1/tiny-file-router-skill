@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import signal
@@ -9,6 +10,43 @@ from pathlib import Path
 from .const import DEFAULT_DATA_DIR, HOME_DATA_DIR
 from .server import TinyServer, send_to_server
 from .router import TinyFileRouter
+
+
+async def run_local(args: argparse.Namespace, data_dir: str) -> None:
+    router = TinyFileRouter(data_dir=data_dir)
+    await router.init()
+    try:
+        if args.command == "put":
+            record = await router.put_file(Path(args.path), filename=args.filename, metadata=json.loads(args.metadata))
+            print(json.dumps({"id": record.id, "filename": record.filename, "sha256": record.sha256, "chunks": record.chunk_count}, indent=2))
+        elif args.command == "get":
+            record = await router.get(args.filename)
+            if record is None:
+                raise SystemExit(f"not found: {args.filename}")
+            out = {
+                "id": record.id,
+                "filename": record.filename,
+                "path": record.path,
+                "sha256": record.sha256,
+                "metadata": record.metadata,
+                "chunks": record.chunk_count,
+            }
+            if args.show_content:
+                out["content"] = record.content
+            print(json.dumps(out, indent=2))
+        elif args.command == "chunks":
+            print(json.dumps(await router.get_chunks(args.filename), indent=2))
+        elif args.command == "search":
+            results = await router.search(args.query, args.top_k, args.chunk_k)
+            if args.hide_chunks:
+                for r in results:
+                    r.pop("best_chunks", None)
+            print(json.dumps(results, indent=2))
+        elif args.command == "rebuild":
+            await router.rebuild_index()
+            print("rebuilt")
+    finally:
+        await router.close()
 
 
 def main() -> None:
@@ -82,39 +120,7 @@ def main() -> None:
         return
 
     # Fallback to local execution
-    router = TinyFileRouter(data_dir=data_dir)
-    try:
-        if args.command == "put":
-            record = router.put_file(Path(args.path), filename=args.filename, metadata=json.loads(args.metadata))
-            print(json.dumps({"id": record.id, "filename": record.filename, "sha256": record.sha256, "chunks": record.chunk_count}, indent=2))
-        elif args.command == "get":
-            record = router.get(args.filename)
-            if record is None:
-                raise SystemExit(f"not found: {args.filename}")
-            out = {
-                "id": record.id,
-                "filename": record.filename,
-                "path": record.path,
-                "sha256": record.sha256,
-                "metadata": record.metadata,
-                "chunks": record.chunk_count,
-            }
-            if args.show_content:
-                out["content"] = record.content
-            print(json.dumps(out, indent=2))
-        elif args.command == "chunks":
-            print(json.dumps(router.get_chunks(args.filename), indent=2))
-        elif args.command == "search":
-            results = router.search(args.query, args.top_k, args.chunk_k)
-            if args.hide_chunks:
-                for r in results:
-                    r.pop("best_chunks", None)
-            print(json.dumps(results, indent=2))
-        elif args.command == "rebuild":
-            router.rebuild_index()
-            print("rebuilt")
-    finally:
-        router.close()
+    asyncio.run(run_local(args, data_dir))
 
 
 if __name__ == "__main__":
