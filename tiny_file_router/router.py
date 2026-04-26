@@ -3,15 +3,27 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Force single-threaded execution to prevent macOS segfaults with OpenMP/MPS
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import faiss
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
+
+# Lock torch to 1 thread
+torch.set_num_threads(1)
 
 from .const import DEFAULT_MODEL, DEFAULT_DATA_DIR, DEFAULT_MAX_CHARS, DEFAULT_OVERLAP_SENTENCES
 
@@ -31,14 +43,7 @@ class FileRecord:
 
 
 class TinyFileRouter:
-    """Tiny content embedding router keyed by filename.
-
-    This version is sentence-aware:
-    - content is split into sentence-preserving chunks
-    - each chunk is embedded
-    - file-level embedding is a weighted average of chunk embeddings
-    - search uses both file vectors and chunk vectors so small needles can still win
-    """
+    """Tiny content embedding router keyed by filename."""
 
     def __init__(
         self,
@@ -52,13 +57,18 @@ class TinyFileRouter:
         self.db_path = self.data_dir / "router.sqlite3"
         self.file_index_path = self.data_dir / "files.faiss"
         self.chunk_index_path = self.data_dir / "chunks.faiss"
-        self.model = SentenceTransformer(model_name)
+        
+        # Load model at startup
+        self.model = SentenceTransformer(model_name, device="cpu")
         self.dim = self.model.get_embedding_dimension()
+        
         self.max_chars = max_chars
         self.overlap_sentences = max(0, overlap_sentences)
+        
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
+        
         self.file_index = self._load_or_create_index(self.file_index_path)
         self.chunk_index = self._load_or_create_index(self.chunk_index_path)
 
@@ -112,7 +122,8 @@ class TinyFileRouter:
     def _embed_many(self, texts: list[str]) -> np.ndarray:
         if not texts:
             return np.zeros((0, self.dim), dtype="float32")
-        vecs = self.model.encode(texts, normalize_embeddings=True)
+        # Disable multi-process encoding which causes segfaults on macOS
+        vecs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False, batch_size=32)
         return np.asarray(vecs, dtype="float32")
 
     def _embed_one(self, text: str) -> np.ndarray:
@@ -142,12 +153,10 @@ class TinyFileRouter:
         return (vec / norm).astype("float32")
 
     def split_sentences(self, text: str) -> list[str]:
-        """Simple dependency-free sentence splitter good enough for routing."""
         text = re.sub(r"\r\n?", "\n", text).strip()
         if not text:
             return []
         parts = [p.strip() for p in _SENTENCE_RE.split(text) if p.strip()]
-        # Split pathological giant sentences so one huge paragraph cannot dominate.
         sentences: list[str] = []
         for part in parts:
             if len(part) <= self.max_chars:
@@ -160,7 +169,6 @@ class TinyFileRouter:
         return sentences
 
     def chunk_text(self, text: str) -> list[str]:
-        """Create sentence-aware chunks with a tiny sentence overlap."""
         sentences = self.split_sentences(text)
         if not sentences:
             return []
@@ -186,7 +194,6 @@ class TinyFileRouter:
 
     @staticmethod
     def chunk_weight(text: str) -> float:
-        """Weight high-signal chunks above boilerplate while avoiding long-text domination."""
         tokens = _WORD_RE.findall(text.lower())
         if not tokens:
             return 0.25
@@ -260,7 +267,6 @@ class TinyFileRouter:
         )
         self.conn.commit()
 
-        # Rebuild for correctness. Tiny DB, simple fix.
         self.rebuild_index()
         record = self.get(filename)
         assert record is not None
@@ -300,7 +306,6 @@ class TinyFileRouter:
         return [{"ordinal": int(r["ordinal"]), "weight": float(r["weight"]), "text": r["text"]} for r in rows]
 
     def search(self, query: str, top_k: int = 5, chunk_k: int | None = None) -> list[dict[str, Any]]:
-        """Search files, combining file-level and best matching chunk-level evidence."""
         if self.file_index.ntotal == 0 and self.chunk_index.ntotal == 0:
             return []
         q = self._embed_one(query)

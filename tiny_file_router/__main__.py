@@ -6,9 +6,9 @@ import os
 import signal
 from pathlib import Path
 
-# Only import lightweight things at top level
 from .const import DEFAULT_DATA_DIR, HOME_DATA_DIR
 from .server import TinyServer, send_to_server
+from .router import TinyFileRouter
 
 
 def main() -> None:
@@ -81,10 +81,7 @@ def main() -> None:
             print(json.dumps(server_res, indent=2))
         return
 
-    # Fallback to slow local execution
-    # HEAVY IMPORT HAPPENS HERE
-    from .router import TinyFileRouter
-    
+    # Fallback to local execution
     router = TinyFileRouter(data_dir=data_dir)
     try:
         if args.command == "put":
