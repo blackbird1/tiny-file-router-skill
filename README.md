@@ -1,110 +1,97 @@
 # Tiny File Router Skill
 
-A minimal local skill for routing files by semantic content.
+A minimal, high-performance local skill for routing files by semantic content. Designed for multi-agent orchestration where multiple LLM-based agents share a single "hot" model instance to minimize context usage and eliminate model-loading overhead.
 
 It uses:
+- `sentence-transformers` (`all-MiniLM-L6-v2`) for efficient 384-dim embeddings.
+- `faiss-cpu` for lightning-fast vector similarity search.
+- `SQLite` for durable storage of content, chunks, and metadata.
+- **Weighted Semantic Routing**: Automatically prioritizes high-signal text (code, unique identifiers) over boilerplate (licenses, imports) when calculating file-level vectors.
 
-- `sentence-transformers` with `all-MiniLM-L6-v2` for embeddings
-- `faiss-cpu` for vector search
-- `SQLite` for filename/content/chunk metadata
-- sentence-aware chunking plus weighted file embeddings for better needle-in-haystack routing
-
-## Install
+## Installation
 
 ```bash
-cd tiny_file_router_skill
+# Clone the repository
+git clone git@github.com:blackbird1/tiny-file-router-skill.git
+cd tiny-file-router-skill
+
+# Set up virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-## CLI usage
+## Quick Start (Hot Server Workflow)
 
-### Add or update a file
-
-```bash
-python -m tiny_file_router put ./docs/example.txt
-```
-
-What happens:
-
-1. Reads the file.
-2. Splits text into sentence-aware chunks.
-3. Embeds each chunk with MiniLM.
-4. Scores each chunk with a lightweight signal weight.
-5. Creates a normalized weighted-average file embedding.
-6. Stores file + chunks in SQLite.
-7. Rebuilds FAISS file and chunk indexes.
-
-### Get a file record by filename
+To achieve sub-second latency across multiple agents, run the persistent background server:
 
 ```bash
-python -m tiny_file_router get example.txt
-```
-
-### Show stored chunks
-
-```bash
-python -m tiny_file_router chunks example.txt
-```
-
-### Search by text query
-
-```bash
-python -m tiny_file_router search "customer billing issue" --top-k 5
-```
-
-Search combines:
-
-- file-level weighted-average similarity
-- chunk-level hits, which helps when the query matches a small but important section buried in a large file
-
-### Rebuild FAISS indexes from SQLite
-
-```bash
-python -m tiny_file_router rebuild
-```
-
-## Shared Background Server
-
-This skill is designed to be shared across multiple agents on the same machine. To avoid the overhead of loading the MiniLM model (approx. 2-5 seconds) for every single call, you can run a persistent background server.
-
-### Start the server
-```bash
+# Start the background server (daemonizes automatically)
 python -m tiny_file_router serve start
-```
-The server will daemonize and store its control files in `~/.tiny_file_router/`.
 
-### Stop the server
+# Check status
+python -m tiny_file_router serve status
+
+# Search is now nearly instantaneous (~400ms)
+python -m tiny_file_router search "how to handle api timeouts"
+```
+
+## CLI Usage
+
+### Indexing Files
 ```bash
+# Index a file (automatically chunks and embeds)
+python -m tiny_file_router put ./path/to/file.txt
+
+# Index with custom filename and metadata
+python -m tiny_file_router put ./path/to/file.txt --filename "custom_name.txt" --metadata '{"version": "v1.0"}'
+```
+
+### Retrieval & Search
+```bash
+# Get file metadata
+python -m tiny_file_router get file.txt
+
+# Search by semantic query (returns file + high-signal chunks)
+python -m tiny_file_router search "database connection logic" --top-k 5
+
+# Show specific chunks for a file
+python -m tiny_file_router chunks file.txt
+```
+
+### Maintenance
+```bash
+# Rebuild FAISS indexes from the SQLite source of truth
+python -m tiny_file_router rebuild
+
+# Stop the background server
 python -m tiny_file_router serve stop
 ```
 
-### How it works
-Once the server is running, any agent or CLI call will automatically:
-1. Detect the Unix Domain Socket at `~/.tiny_file_router/router.sock`.
-2. Send the request to the "hot" instance.
-3. Receive a nearly instantaneous response.
+## Multi-Agent Design
 
-If the server is not running, the skill gracefully falls back to loading the model locally.
+This skill is architected for **shared local environments**:
+- **Shared Socket**: All agents on the same machine connect to `~/.tiny_file_router/router.sock`.
+- **Zero-Config Discovery**: CLI commands automatically detect the "hot" server.
+- **Graceful Fallback**: If the server is not running, commands automatically fall back to local model execution.
 
-## Tuning
+## Configuration
 
+Tweak behavior via environment variables:
 ```bash
-export TINY_ROUTER_DATA_DIR=/path/to/data
-export TINY_ROUTER_CHUNK_MAX_CHARS=900
-export TINY_ROUTER_OVERLAP_SENTENCES=1
+export TINY_ROUTER_DATA_DIR=./my_data           # Custom storage path
+export TINY_ROUTER_CHUNK_MAX_CHARS=900          # Max chars per chunk
+export TINY_ROUTER_OVERLAP_SENTENCES=1          # Sentence overlap for context
 ```
 
 ## Storage
 
-By default, data is stored under:
+Data is stored in the specified `router_data` directory:
+- `router.sqlite3`: The durable source of truth.
+- `files.faiss` / `chunks.faiss`: Derived indexes for fast retrieval.
 
-```text
-./router_data/
-  router.sqlite3
-  files.faiss
-  chunks.faiss
-```
+## License
 
-SQLite is the durable source of truth. FAISS is derived and can always be rebuilt.
+MIT © 2026 Stephen Turner
