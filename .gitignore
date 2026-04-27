@@ -6,6 +6,7 @@ __pycache__/
 # Local data and indexes
 router_data/
 .closedloop-ai/
+.gemini/
 
 # Test artifacts
 test_files/
