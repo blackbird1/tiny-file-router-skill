@@ -379,7 +379,9 @@ class TinyFileRouter:
         return [{"ordinal": int(r["ordinal"]), "weight": float(r["weight"]), "text": r["text"]} for r in rows]
 
     async def search(self, query: str, top_k: int = 5, chunk_k: int | None = None) -> list[dict[str, Any]]:
-        q = await self._embed_one(query)
+        # BGE models perform better with a specific query prefix
+        search_query = f"Represent this sentence for searching relevant passages: {query}"
+        q = await self._embed_one(search_query)
         query_tokens = self._query_tokens(query)
 
         file_scores: dict[int, float] = {}

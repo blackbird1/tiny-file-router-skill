@@ -9,7 +9,7 @@ def find_project_root() -> Path:
             return parent
     return curr
 
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 PROJECT_ROOT = find_project_root()
 DEFAULT_DATA_DIR = PROJECT_ROOT / "router_data"
 DEFAULT_MAX_CHARS = int(os.environ.get("TINY_ROUTER_CHUNK_MAX_CHARS", "900"))
