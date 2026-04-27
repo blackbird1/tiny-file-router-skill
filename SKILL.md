@@ -8,7 +8,9 @@ description: A semantic file router that uses MiniLM embeddings and FAISS for fa
 
 Use this skill when local agents or LLMs need a tiny semantic router over files.
 
-**Architecture:** This skill is designed for **multi-agent orchestration**. Multiple agents running on the same machine can share a single, persistent MiniLM model instance via a background server. This eliminates model-loading overhead and ensures consistent routing across different tools.
+**Primary Interface:** This skill is an **MCP (Model Context Protocol)** server. It is designed for standardized multi-agent orchestration, allowing agents to discover and use semantic search tools automatically.
+
+**Architecture:** It uses a shared, persistent MiniLM model instance via a background server to eliminate model-loading overhead and provide sub-sub-second response times.
 
 The skill can:
 
@@ -20,26 +22,32 @@ The skill can:
 6. Maintain FAISS indexes for both files and chunks.
 7. Retrieve by exact filename.
 8. Search by semantic similarity with chunk-level evidence for needle-in-haystack matches.
-9. Boost exact query-token overlap so search can act as a context filter on large files.
+
+## MCP Tools
+
+- `router_search(query, top_k, chunk_k)`: Search files by semantic similarity. Returns relevant chunks of text.
+- `router_index_file(path, filename)`: Index a file for semantic search. Breaks it into high-signal chunks.
 
 ## Commands
 
 ```bash
-python -m tiny_file_router put ./file.txt
-python -m tiny_file_router get file.txt
-python -m tiny_file_router chunks file.txt
-python -m tiny_file_router search "what this file is about"
-python -m tiny_file_router rebuild
+# Run as MCP Standard I/O server (Preferred for agents)
+python -m tiny_file_router mcp
+
+# Manage the high-performance background server
 python -m tiny_file_router serve start
 python -m tiny_file_router serve stop
+
+# Manual CLI operations
+python -m tiny_file_router put ./file.txt
+python -m tiny_file_router search "what this file is about"
 ```
 
 ## Shared Server Design
 
-SQLite is the durable source of truth. FAISS is treated as a fast derived index.
-Search is hybrid: embeddings rank candidates, then exact query-token overlap boosts files and suppresses weak semantic neighbors when the query has real terms.
+SQLite is the durable source of truth. FAISS is derived and can always be rebuilt.
 
-To avoid reloading the MiniLM model (384-dim) for every agent call, the skill uses a background "hot" server:
-- **Socket**: `~/.tiny_file_router/router.sock` (Unix Domain Socket)
+To avoid reloading the MiniLM model (384-dim) for every agent call, the skill uses an optimized background service:
+- **Unix Socket**: `~/.tiny_file_router/router.sock` (High-performance local communication)
 - **PID**: `~/.tiny_file_router/server.pid`
-- **Global Access**: Any agent on the same machine using this library will automatically detect the socket and route requests to the hot instance. If the server is not running, it gracefully falls back to local execution.
+- **Global Access**: Any agent using the MCP interface will automatically relay through the hot instance if available.

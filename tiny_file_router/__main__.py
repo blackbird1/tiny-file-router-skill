@@ -76,8 +76,15 @@ def main() -> None:
     srv = sub.add_parser("serve", help="Manage the persistent background server")
     srv.add_argument("action", choices=["start", "stop", "status"])
 
+    sub.add_parser("mcp", help="Run the MCP Standard I/O server")
+
     args = parser.parse_args()
     data_dir = os.environ.get("TINY_ROUTER_DATA_DIR", str(DEFAULT_DATA_DIR))
+
+    if args.command == "mcp":
+        from .mcp import run as run_mcp
+        asyncio.run(run_mcp())
+        return
 
     if args.command == "serve":
         pid_file = HOME_DATA_DIR / "server.pid"
