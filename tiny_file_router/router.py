@@ -7,6 +7,7 @@ import os
 import re
 import asyncio
 import aiosqlite
+import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -231,6 +232,42 @@ class TinyFileRouter:
         avg = np.average(chunk_embeddings, axis=0, weights=w)
         return self._normalize(avg)
 
+    def _get_file_context(self, filename: str, path: str = "") -> str:
+        """Generate a context string based on filename and mime type."""
+        ext = Path(filename).suffix.lower()
+        if not ext and path:
+            ext = Path(path).suffix.lower()
+        
+        # Specialized mapping for high-signal extensions
+        mapping = {
+            ".py": "Python source code",
+            ".js": "JavaScript source code",
+            ".ts": "TypeScript source code",
+            ".go": "Go source code",
+            ".rs": "Rust source code",
+            ".c": "C source code",
+            ".cpp": "C++ source code",
+            ".h": "C/C++ header",
+            ".md": "Markdown documentation",
+            ".txt": "Plain text document",
+            ".json": "JSON data",
+            ".yaml": "YAML configuration",
+            ".yml": "YAML configuration",
+            ".sh": "Shell script",
+            ".sql": "SQL database script",
+            ".html": "HTML web page",
+            ".css": "CSS stylesheet",
+        }
+        
+        file_type = mapping.get(ext)
+        if not file_type:
+            mime, _ = mimetypes.guess_type(filename)
+            if not mime and path:
+                mime, _ = mimetypes.guess_type(path)
+            file_type = mime or "unknown"
+
+        return f"File: {filename} (Type: {file_type})"
+
     async def put_file(self, path: str | Path, filename: str | None = None, metadata: dict[str, Any] | None = None) -> FileRecord:
         p = Path(path)
         name = filename or p.name
@@ -246,9 +283,17 @@ class TinyFileRouter:
     ) -> FileRecord:
         metadata = metadata or {}
         sha = self._sha256(content)
-        chunks = self.chunk_text(content) or [content]
+        
+        # Enhance content with file context for better semantic grounding
+        context = self._get_file_context(filename, path)
+        enhanced_content = f"{context}\n\n{content}"
+        
+        chunks = self.chunk_text(enhanced_content) or [enhanced_content]
         chunk_embeddings = await self._embed_many(chunks)
         weights = [self.chunk_weight(c) for c in chunks]
+        
+        # Include context-only embedding for better file-level category matching
+        # but don't store it as a separate chunk to avoid cluttering results.
         file_embedding = self.weighted_file_embedding(chunk_embeddings, weights)
         blob = file_embedding.astype("float32").tobytes()
 
